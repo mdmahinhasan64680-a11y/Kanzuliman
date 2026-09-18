@@ -1,4 +1,4 @@
-name: Merge Arabic + Bangla Rizwan
+name: Merge Arabic + Bangla Mahin
 
 on:
   workflow_dispatch:
