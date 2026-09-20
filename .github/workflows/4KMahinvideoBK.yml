@@ -45,7 +45,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
     permissions:
       contents: write
     steps:
@@ -57,6 +56,11 @@ jobs:
           pip install Pillow
           sudo apt-get update && sudo apt-get install -y ffmpeg bc
 
+      # ---------------------------------------------------------
+      # ধাপ ০: background_video ইনপুট চেক - এক বা একাধিক (কমা দিয়ে আলাদা)
+      # পাথ/URL থাকতে পারে। URL হলে ডাউনলোড, লোকাল হলে সরাসরি ব্যবহার।
+      # সবগুলোর একটা লিস্ট (bg_list.txt) বানানো হয়, পরের ধাপে merge হবে।
+      # ---------------------------------------------------------
       - name: Resolve background video(s) (download if URL, supports multiple)
         id: resolve_bg
         env:
@@ -65,12 +69,14 @@ jobs:
           set -e
           mkdir -p downloaded
           > bg_list.txt
+
           IFS=',' read -ra ITEMS <<< "${BG_INPUT:-src/background.mp4}"
           COUNT=0
           for RAW in "${ITEMS[@]}"; do
-            ITEM=$(echo "$RAW" | xargs)
+            ITEM=$(echo "$RAW" | xargs)  # trim leading/trailing space
             [ -z "$ITEM" ] && continue
             COUNT=$((COUNT+1))
+
             if [[ "$ITEM" == http://* || "$ITEM" == https://* ]]; then
               echo "Link দেওয়া আছে ($COUNT), ডাউনলোড করা হচ্ছে: $ITEM"
               EXT="${ITEM##*.}"
@@ -78,6 +84,7 @@ jobs:
                 mp4|mov|mkv|webm) OUT_FILE="downloaded/bg_${COUNT}.$EXT" ;;
                 *) OUT_FILE="downloaded/bg_${COUNT}.mp4" ;;
               esac
+
               if curl -L -f --retry 3 --retry-delay 5 -o "$OUT_FILE" "$ITEM" && [ -s "$OUT_FILE" ]; then
                 echo "$OUT_FILE" >> bg_list.txt
               else
@@ -92,13 +99,21 @@ jobs:
               fi
             fi
           done
+
           if [ ! -s bg_list.txt ]; then
             echo "Kono valid background video paoa jayni - default src/background.mp4 use kora hocche"
             echo "src/background.mp4" > bg_list.txt
           fi
+
           echo "Resolved background video list:"
           cat bg_list.txt
 
+      # ---------------------------------------------------------
+      # ধাপ ১: শুধু নির্দিষ্ট সূরার আয়াতগুলোর জন্য transparent overlay বানানো
+      # (পোর্ট্রেট 9:16 ডিজাইন: পিল ব্যাজ + গোল আয়াত-নম্বর ব্যাজ + আরবি/বাংলা বার + লোগো)
+      # Overlay master resolution (target_width x target_height) অনুযায়ী বানানো হয়,
+      # পরে এই একই master থেকে Full HD ও HD ডাউনস্কেল হবে।
+      # ---------------------------------------------------------
       - name: Generate Overlays for this Surah
         env:
           ARABIC_NAME: ${{ inputs.arabic_name }}
@@ -335,7 +350,18 @@ jobs:
               print(f"Done {filename} | AR font {ar_size} BN font {bn_size} | badge={draw_badge}")
           PY
 
-
+      # ---------------------------------------------------------
+      # ধাপ ১.৫: এই সূরার আয়াতগুলোর অডিও এনহ্যান্স করা হচ্ছে -
+      #  - afftdn: noise floor অনুযায়ী স্মার্ট noise/hiss/hum reduction
+      #  - highpass/lowpass: কণ্ঠের বাইরের rumble ও hiss ফ্রিকোয়েন্সি বাদ
+      #  - loudnorm: EBU R128 স্ট্যান্ডার্ডে সব আয়াতের ভলিউম সমান (normalize)
+      #
+      # মূল audio_folder-এর ফাইল অপরিবর্তিত থাকে - এনহ্যান্সড কপি আলাদা
+      # enhanced_audio/ ফোল্ডারে সেভ হয়। পরের ধাপে (per-ayah ক্লিপ
+      # বানানো) এই এনহ্যান্সড অডিওই ব্যবহার হবে; কোনো কারণে কোনো ফাইলের
+      # এনহ্যান্স ব্যর্থ/মিসিং হলে সেই ধাপে স্বয়ংক্রিয়ভাবে মূল ফাইলে
+      # fallback করবে।
+      # ---------------------------------------------------------
       - name: Enhance & denoise ayah audio
         env:
           AUDIO_DIR: ${{ inputs.audio_folder }}
@@ -368,7 +394,12 @@ jobs:
           echo "Enhanced audio files:"
           ls -lh "$ENHANCED_DIR" 2>/dev/null || echo "(kono file enhance hoyni)"
 
-
+      # ---------------------------------------------------------
+      # ধাপ ২: প্রতিটা background ভিডিও আলাদাভাবে normalize (resolution/fps
+      # এক করা) করে, তারপর সবগুলো ক্রমানুসারে concat করে একটা একক
+      # ব্যাকগ্রাউন্ড ভিডিও বানানো হয় (একটা দিলে সেটাই normalize হয়ে যাবে)
+      # এই ভিডিওটাই master resolution-এ (target_width x target_height) থাকবে।
+      # ---------------------------------------------------------
       - name: Normalize & merge background video(s)
         env:
           TARGET_W: ${{ inputs.target_width }}
@@ -403,25 +434,35 @@ jobs:
 
           ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 normalized/background_normalized.mp4
 
-
       # ---------------------------------------------------------
-      # FIXED ধাপ ২.৫: Ping-pong cycle - sudhu choto cycle banano hobe
-      # Ager problem: full TOTAL_DURATION er 4K video pre-render korto
-      # - tai 4m 24s por runner cancel hoye jeto
-      # Ekhon: sudhu 1 ta forward+reverse cycle (30-60s) banabo
+      # ধাপ ২.৫: normalize/merge করা background video থেকে একটা
+      # seamless "ping-pong" (forward + reverse) ভিডিও বানানো হচ্ছে।
+      #
+      # কেন: পরের ধাপে background video-কে "-stream_loop -1" দিয়ে
+      # বারবার লুপ করানো হয়। প্লেইন background loop করলে ভিডিও শেষ
+      # প্রান্তে পৌঁছেই হঠাৎ শুরুতে (0:00) জাম্প করে - যেটা দেখতে
+      # অস্বাভাবিক/ঝাঁকুনি লাগে।
+      #
+      # সমাধান: background_normalized.mp4 -কে reverse করে
+      # background_reversed.mp4 বানানো হয়, তারপর দুটো concat করে
+      # (forward + reverse) একটা background_pingpong.mp4 বানানো হয়।
+      # এই ফাইলটা loop করালে: forward শেষ হলে reverse শুরু হয়ে একই
+      # ফ্রেম থেকে পেছনের দিকে চলে (কোনো জাম্প নেই), আবার reverse শেষে
+      # (frame 0) পরের লুপের forward শুরুও frame 0 থেকেই হয় (কোনো
+      # জাম্প নেই) - ফলে পুরোপুরি seamless লুপ হয়।
+      #
+      # নোট: "reverse" ফিল্টার পুরো ভিডিও মেমরিতে লোড করে, তাই খুব
+      # লম্বা/ভারী background video হলে runner-এর RAM কম পড়তে পারে।
       # ---------------------------------------------------------
-      - name: Create seamless ping-pong (forward+reverse) background - FIXED
-        timeout-minutes: 15
+      - name: Create seamless ping-pong (forward+reverse) background
         run: |
           set -e
-          echo "Background video reverse kore ping-pong loop banano hocche..."
-          INPUT="normalized/background_normalized.mp4"
+          echo "Background video reverse kore ping-pong loop banano hocche (jate loop wrap howar somoy hothat jump na hoy, borong reverse hoye fire ashe)..."
 
-          # Reverse - ultrafast preset diye (medium onek slow)
           ffmpeg -y -hide_banner -loglevel error \
-            -i "$INPUT" \
+            -i normalized/background_normalized.mp4 \
             -vf "reverse" -an \
-            -c:v libx264 -preset ultrafast -crf 20 -pix_fmt yuv420p \
+            -c:v libx264 -preset medium -crf 16 -pix_fmt yuv420p \
             normalized/background_reversed.mp4
 
           echo "file '$(realpath normalized/background_normalized.mp4)'" > pingpong_concat_list.txt
@@ -429,23 +470,41 @@ jobs:
 
           ffmpeg -y -hide_banner -loglevel error \
             -f concat -safe 0 -i pingpong_concat_list.txt \
-            -c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p -an \
+            -c copy \
             normalized/background_pingpong.mp4
 
-          # Reversed intermediate delete - disk bachate
           rm -f normalized/background_reversed.mp4 pingpong_concat_list.txt
 
-          CYCLE=$(ffprobe -v error -show_entries format=duration -of csv=p=0 normalized/background_pingpong.mp4)
-          echo "CYCLE_DURATION=$CYCLE" >> $GITHUB_ENV
-          echo "Ping-pong ready: ${CYCLE}s"
-          ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 normalized/background_pingpong.mp4
+          echo "Ping-pong background toiri holo, duration:"
+          ffprobe -v error -show_entries format=duration -of csv=p=0 normalized/background_pingpong.mp4
 
       # ---------------------------------------------------------
-      # FIXED ধাপ ৩: Per-ayah clips - BG_FULL pre-render bad
-      # Modulo offset diye ping-pong cycle er vitore seamless cut
+      # ধাপ ৩: প্রতিটা আয়াতের ক্লিপ বানানো (background + overlay + audio)
+      #
+      # আগে প্রতিটা আয়াতের ffmpeg কলে আলাদাভাবে
+      # "-ss $OFFSET -stream_loop -1 -i pingpong" ব্যবহার করা হতো।
+      # সমস্যা: বড় -ss মান আর -stream_loop -1 একসাথে দিলে ffmpeg-এর
+      # wraparound আচরণ নির্দিষ্ট (predictable) না - ফলে background
+      # এলোমেলোভাবে ঘন ঘন/আংশিক reverse-এ চলে যাচ্ছিল, পরিষ্কার
+      # "শুরু -> রিভার্স -> শুরু -> রিভার্স" প্যাটার্ন থাকছিল না।
+      #
+      # সমাধান (deterministic approach):
+      #  ৩.১) আগে এই সূরার সবগুলো আয়াতের অডিও দৈর্ঘ্য যোগ করে
+      #       TOTAL_DURATION বের করা হচ্ছে।
+      #  ৩.২) ping-pong cycle (forward+reverse) কতবার লাগবে TOTAL_DURATION
+      #       কভার করতে, সেটা হিসাব করে সেই কয়েকবার loop করে একটাই
+      #       নির্দিষ্ট-দৈর্ঘ্যের, পুরোপুরি রেন্ডার করা background_full.mp4
+      #       বানানো হচ্ছে (এখানে re-encode করে frame-accurate trim করা
+      #       হয়, যাতে প্রতিটা cycle বাউন্ডারি নিখুঁত থাকে)।
+      #  ৩.৩) প্রতিটা আয়াতের ক্লিপের জন্য আর কোনো stream_loop লাগছে না -
+      #       শুধু এই একটাই পূর্ণাঙ্গ background_full.mp4 থেকে
+      #       "-ss $OFFSET" দিয়ে ক্রমান্বয়ে অংশ কেটে নেওয়া হচ্ছে।
+      #
+      # ফলাফল: পুরো সূরার ভিডিও জুড়ে background ঠিক
+      # শুরু -> রিভার্স -> শুরু -> রিভার্স ... এই প্যাটার্নেই চলবে,
+      # কোনো এলোমেলো/ঘনঘন জাম্প বা আংশিক রিভার্স হবে না।
       # ---------------------------------------------------------
-      - name: Build per-ayah clips and merge - FIXED (no BG_FULL pre-render)
-        timeout-minutes: 120
+      - name: Build per-ayah clips and merge
         env:
           AUDIO_DIR: ${{ inputs.audio_folder }}
           SURAH: ${{ inputs.surah_number }}
@@ -454,12 +513,14 @@ jobs:
           TEMP_VIDEO_DIR="temp_${SURAH}_videos"
           FINAL_DIR="rizwanSurahVideo"
           PINGPONG="normalized/background_pingpong.mp4"
+          BG_FULL="normalized/background_full.mp4"
           ENHANCED_AUDIO_DIR="enhanced_audio"
-          TARGET_W="${{ inputs.target_width }}"
-          TARGET_H="${{ inputs.target_height }}"
 
           mkdir -p "$TEMP_VIDEO_DIR" "$FINAL_DIR"
 
+          # অডিও এনহ্যান্সড ভার্সন থাকলে সেটাই ব্যবহার হবে, না থাকলে
+          # (enhance স্টেপ কোনো কারণে fail/skip করলে) মূল audio_folder-এর
+          # ফাইলে fallback করবে।
           resolve_audio_file() {
             local base="$1"
             if [ -f "$ENHANCED_AUDIO_DIR/$base.mp3" ]; then
@@ -469,6 +530,8 @@ jobs:
             fi
           }
 
+          # ৩.১: এই সূরার সবগুলো আয়াতের অডিও দৈর্ঘ্য যোগ করে মোট
+          # প্রয়োজনীয় background দৈর্ঘ্য বের করা হচ্ছে।
           TOTAL_DURATION=0
           for overlay_file in $(ls overlays/${SURAH}*.png 2>/dev/null | sort -V); do
             [ -e "$overlay_file" ] || continue
@@ -480,41 +543,64 @@ jobs:
           done
 
           if [ -z "$TOTAL_DURATION" ] || [ "$(echo "$TOTAL_DURATION <= 0" | bc)" -eq 1 ]; then
-            echo "Kono audio duration paoa jayni Surah $SURAH er jonno"
+            echo "Kono audio duration paoa jayni Surah $SURAH er jonno - overlay/audio folder check koro"
             exit 1
           fi
-          echo "Total duration: ${TOTAL_DURATION}s | Cycle: ${CYCLE_DURATION}s"
+          echo "Total surah audio duration: ${TOTAL_DURATION}s"
 
+          # ৩.২: ping-pong cycle (forward+reverse) কতবার loop করলে পুরো
+          # সূরার দৈর্ঘ্য কাভার হবে সেটা বের করে, একটা নির্দিষ্ট
+          # দৈর্ঘ্যের পূর্ণাঙ্গ background বানানো হচ্ছে (একটু বাড়তি buffer
+          # সহ, তারপর ঠিক TOTAL_DURATION পর্যন্ত ট্রিম করা হয়)।
+          CYCLE_DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$PINGPONG")
+          LOOP_COUNT=$(awk -v t="$TOTAL_DURATION" -v c="$CYCLE_DURATION" 'BEGIN{n=t/c; if (n<1) n=1; printf "%d", n+3}')
+          echo "Ping-pong cycle duration: ${CYCLE_DURATION}s | Loop count: $LOOP_COUNT"
+
+          ffmpeg -y -hide_banner -loglevel error \
+            -stream_loop "$LOOP_COUNT" -i "$PINGPONG" \
+            -t "$TOTAL_DURATION" \
+            -c:v libx264 -preset medium -crf 16 -pix_fmt yuv420p \
+            -an \
+            "$BG_FULL"
+
+          echo "Full continuous ping-pong background toiri holo:"
+          ffprobe -v error -show_entries format=duration -of csv=p=0 "$BG_FULL"
+
+          # ৩.৩: এখন প্রতিটা আয়াতের ক্লিপ এই একই পূর্ণাঙ্গ background
+          # থেকে ক্রমান্বয়ে (cumulative OFFSET অনুযায়ী) কেটে নেওয়া হচ্ছে -
+          # কোনো stream_loop লাগছে না, তাই wraparound-জনিত এলোমেলো
+          # আচরণের সুযোগ নেই।
           OFFSET=0
+
           for overlay_file in $(ls overlays/${SURAH}*.png 2>/dev/null | sort -V); do
             [ -e "$overlay_file" ] || continue
             base=$(basename "$overlay_file" .png)
             audio_file=$(resolve_audio_file "$base")
+
             if [ ! -f "$audio_file" ]; then
               echo "Audio missing: $audio_file - Skipping"
               continue
             fi
-            DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$audio_file")
-            OFFSET_MOD=$(awk -v o="$OFFSET" -v c="$CYCLE_DURATION" 'BEGIN{printf "%.3f", o % c}')
-            echo "Processing $base | OFFSET ${OFFSET} (mod $OFFSET_MOD) | DUR $DURATION"
 
-            # stream_loop 2 diye cycle ke 3 bar repeat kora hocche jate ss + duration er jonno enough data thake
+            DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$audio_file")
+            echo "Processing $base | background offset: ${OFFSET}s | audio duration: ${DURATION}s"
+
             ffmpeg -y -hide_banner -loglevel error \
-              -stream_loop 2 -i "$PINGPONG" \
+              -ss "$OFFSET" -i "$BG_FULL" \
               -loop 1 -i "$overlay_file" \
               -i "$audio_file" \
-              -filter_complex "[0:v]trim=start=$OFFSET_MOD:setpts=PTS-STARTPTS,scale=${TARGET_W}:${TARGET_H}:flags=bicubic:force_original_aspect_ratio=disable,setsar=1[bg];[bg][1:v]overlay=0:0:shortest=1:format=yuv420[outv]" \
+              -filter_complex "[0:v][1:v]overlay=0:0:shortest=1[outv]" \
               -map "[outv]" -map 2:a \
-              -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p \
+              -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p \
               -c:a aac -b:a 192k \
-              -shortest -t "$DURATION" \
+              -shortest \
               "$TEMP_VIDEO_DIR/$base.mp4"
 
             OFFSET=$(echo "$OFFSET + $DURATION" | bc)
           done
 
           if ! ls "$TEMP_VIDEO_DIR"/${SURAH}*.mp4 1> /dev/null 2>&1; then
-            echo "Kono clip toiri hoyni"
+            echo "Kono clip toiri hoyni Surah $SURAH er jonno - overlay ba audio file check koro"
             exit 1
           fi
 
@@ -531,10 +617,13 @@ jobs:
           rm -rf "$TEMP_VIDEO_DIR" concat_list.txt
 
       # ---------------------------------------------------------
-      # ধাপ ৪: Master theke FullHD & HD downscale (ager motoi)
+      # ধাপ ৪: master (4K) ভিডিও থেকেই Full HD (1080x1920) ও HD (720x1280)
+      # ভার্সন বানানো হচ্ছে - overlay/background আবার নতুন করে বানানো বা
+      # প্রতি-আয়াত ক্লিপ আবার এনকোড করা লাগছে না, শুধু ফাইনাল মাস্টার
+      # ভিডিওটাকে দুইবার downscale করা হচ্ছে। এতে খরচ (সময়/রিসোর্স) অনেক
+      # কম হয়, বিশেষ করে বেশি আয়াতের সূরার (যেমন বাকারা) ক্ষেত্রে।
       # ---------------------------------------------------------
       - name: Create Full HD & HD versions from the 4K master
-        timeout-minutes: 30
         env:
           SURAH: ${{ inputs.surah_number }}
         run: |
@@ -546,7 +635,7 @@ jobs:
           ffmpeg -y -hide_banner -loglevel error \
             -i "$MASTER" \
             -vf "scale=1080:1920:flags=lanczos,setsar=1" \
-            -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p \
+            -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p \
             -c:a copy \
             "$FINAL_DIR/${SURAH}_FullHD.mp4"
 
@@ -554,7 +643,7 @@ jobs:
           ffmpeg -y -hide_banner -loglevel error \
             -i "$MASTER" \
             -vf "scale=720:1280:flags=lanczos,setsar=1" \
-            -c:v libx264 -preset fast -crf 20 -pix_fmt yuv420p \
+            -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p \
             -c:a copy \
             "$FINAL_DIR/${SURAH}_HD.mp4"
 
@@ -565,12 +654,22 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Surah-${{ inputs.surah_number }}-Portrait-Video-AllResolutions
+          # পুরো rizwanSurahVideo/ ফোল্ডার আপলোড না করে, এই রানে তৈরি হওয়া
+          # শুধু এই সূরার ৩টা রেজোলিউশন ফাইলই আপলোড করা হচ্ছে - ফোল্ডারে
+          # থেকে যাওয়া অন্য কোনো পুরনো/অপ্রাসঙ্গিক .mp4 ফাইল (আগের রান বা
+          # রিপোতে আগে থেকে থাকা ফাইল) আপলোড হবে না।
           path: |
             rizwanSurahVideo/${{ inputs.surah_number }}_4K.mp4
             rizwanSurahVideo/${{ inputs.surah_number }}_FullHD.mp4
             rizwanSurahVideo/${{ inputs.surah_number }}_HD.mp4
           if-no-files-found: error
 
+      # ---------------------------------------------------------
+      # ধাপ ৫: 4K, Full HD ও HD - তিনটা ফাইলই একসাথে একই GitHub Release-এ
+      # পাবলিশ করা হচ্ছে (এক ধাপেই)। ভিডিও রিপোতে commit/push করা হবে না,
+      # শুধু Release asset হিসেবে থাকবে - 100MB লিমিট এড়াতে সাহায্য করে,
+      # Release-এ প্রতি ফাইল 2GB পর্যন্ত রাখা যায়।
+      # ---------------------------------------------------------
       - name: Publish Surah Video (4K + Full HD + HD) as GitHub Release
         uses: softprops/action-gh-release@v2
         with:
