@@ -186,8 +186,8 @@ jobs:
           SIDE_MARGIN     = int(50 * SCALE)
           MAX_TEXT_W      = W - 2 * SIDE_MARGIN
           # ফেসবুক রিলসের নিচের ইউআই (লাইক, কমেন্ট, ক্যাপশন) যাতে লেখা না ঢাকে, 
-          # সেজন্য নিچ থেকে মার্জিন বাড়িয়ে ১৫ ডিপি (স্কেল অনুযায়ী) ওপরে তোলা হলো:
-          BOTTOM_MARGIN   = int((90 + 15) * SCALE)
+          # সেজন্য ভিডিওর বটম থেকে ঠিক ৩০ ডিপি (স্কেল অনুযায়ী) ওপরে রাখা হলো:
+          BOTTOM_MARGIN   = int(30 * SCALE)
           TOP_LIMIT       = int(H * 0.30)
           MAX_BLOCK_RATIO = 0.60
 
