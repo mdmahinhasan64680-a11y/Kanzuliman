@@ -1,0 +1,618 @@
+name: New Mahin Generate Surah Audio Video (All-in-One)
+
+on:
+  workflow_dispatch:
+    inputs:
+      surah_number:
+        description: 'সূরা নম্বর (যেমন: 111)'
+        required: true
+        type: string
+      arabic_name:
+        description: 'আরবি সূরার নাম (এখন ছবিতে দেখানো হয় না, তবু রাখা হয়েছে ভবিষ্যতের জন্য)'
+        required: false
+        default: ''
+        type: string
+      bangla_name:
+        description: 'বাংলা সূরার নাম (পিল ব্যাজে দেখাবে)'
+        required: true
+        type: string
+      background_video:
+        description: 'এক বা একাধিক Background video - repo-এর ভেতরের পাথ এবং/অথবা সরাসরি ডাউনলোডযোগ্য URL (http/https), একাধিক হলে কমা (,) দিয়ে আলাদা করুন। যেমন: src/bg1.mp4, https://example.com/bg2.mp4 - এগুলো ক্রমানুসারে জোড়া লেগে একটাই ব্যাকগ্রাউন্ড ভিডিও হবে। খালি রাখলে ডিফল্ট src/background.mp4 ব্যবহার হবে।'
+        required: false
+        default: 'src/background.mp4'
+        type: string
+      audio_folder:
+        description: 'Audio folder'
+        required: false
+        default: 'rizwanaudio'
+        type: string
+      logo_path:
+        description: 'Logo image path (top-right corner-এ বসবে)'
+        required: false
+        default: 'src/logo.jpg'
+        type: string
+      target_width:
+        description: 'Master (সর্বোচ্চ কোয়ালিটি) video width - এটা থেকেই Full HD ও HD ভার্সন ডাউনস্কেল হবে। ডিফল্ট 4K পোর্ট্রেট।'
+        required: false
+        default: '2160'
+        type: string
+      target_height:
+        description: 'Master (সর্বোচ্চ কোয়ালিটি) video height - এটা থেকেই Full HD ও HD ভার্সন ডাউনস্কেল হবে। ডিফল্ট 4K পোর্ট্রেট।'
+        required: false
+        default: '3840'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: |
+          pip install Pillow
+          sudo apt-get update && sudo apt-get install -y ffmpeg bc
+
+      # ---------------------------------------------------------
+      # ধাপ ০: background_video ইনপুট চেক - এক বা একাধিক (কমা দিয়ে আলাদা)
+      # পাথ/URL থাকতে পারে। URL হলে ডাউনলোড, লোকাল হলে সরাসরি ব্যবহার।
+      # সবগুলোর একটা লিস্ট (bg_list.txt) বানানো হয়, পরের ধাপে merge হবে।
+      # ---------------------------------------------------------
+      - name: Resolve background video(s) (download if URL, supports multiple)
+        id: resolve_bg
+        env:
+          BG_INPUT: ${{ inputs.background_video }}
+        run: |
+          set -e
+          mkdir -p downloaded
+          > bg_list.txt
+
+          IFS=',' read -ra ITEMS <<< "${BG_INPUT:-src/background.mp4}"
+          COUNT=0
+          for RAW in "${ITEMS[@]}"; do
+            ITEM=$(echo "$RAW" | xargs)  # trim leading/trailing space
+            [ -z "$ITEM" ] && continue
+            COUNT=$((COUNT+1))
+
+            if [[ "$ITEM" == http://* || "$ITEM" == https://* ]]; then
+              echo "Link দেওয়া আছে ($COUNT), ডাউনলোড করা হচ্ছে: $ITEM"
+              EXT="${ITEM##*.}"
+              case "$EXT" in
+                mp4|mov|mkv|webm) OUT_FILE="downloaded/bg_${COUNT}.$EXT" ;;
+                *) OUT_FILE="downloaded/bg_${COUNT}.mp4" ;;
+              esac
+
+              if curl -L -f --retry 3 --retry-delay 5 -o "$OUT_FILE" "$ITEM" && [ -s "$OUT_FILE" ]; then
+                echo "$OUT_FILE" >> bg_list.txt
+              else
+                echo "Download failed for: $ITEM - skip kora hocche"
+              fi
+            else
+              if [ -f "$ITEM" ]; then
+                echo "Local path use kora hocche ($COUNT): $ITEM"
+                echo "$ITEM" >> bg_list.txt
+              else
+                echo "Local file paoa jayni: $ITEM - skip kora hocche"
+              fi
+            fi
+          done
+
+          if [ ! -s bg_list.txt ]; then
+            echo "Kono valid background video paoa jayni - default src/background.mp4 use kora hocche"
+            echo "src/background.mp4" > bg_list.txt
+          fi
+
+          echo "Resolved background video list:"
+          cat bg_list.txt
+
+      # ---------------------------------------------------------
+      # ধাপ ১: শুধু নির্দিষ্ট সূরার আয়াতগুলোর জন্য transparent overlay বানানো
+      # (পোর্ট্রেট 9:16 ডিজাইন: পিল ব্যাজ + গোল আয়াত-নম্বর ব্যাজ + আরবি/বাংলা বার + লোগো)
+      # Overlay master resolution (target_width x target_height) অনুযায়ী বানানো হয়,
+      # পরে এই একই master থেকে Full HD ও HD ডাউনস্কেল হবে।
+      # ---------------------------------------------------------
+      - name: Generate Overlays for this Surah
+        env:
+          ARABIC_NAME: ${{ inputs.arabic_name }}
+          BANGLA_NAME: ${{ inputs.bangla_name }}
+          SURAH_NUMBER: ${{ inputs.surah_number }}
+          LOGO_PATH: ${{ inputs.logo_path }}
+          TARGET_W: ${{ inputs.target_width }}
+          TARGET_H: ${{ inputs.target_height }}
+        run: |
+          python3 << 'PY'
+          from PIL import Image, ImageDraw, ImageFont
+          import json, os, re
+
+          DATA = "src/data.json"
+          OUT = "overlays"
+          FONT_BN = "src/solaimanlipi.ttf"
+          FONT_AR = "src/noorehuda.ttf"
+
+          W = int(os.environ.get("TARGET_W", "2160"))
+          H = int(os.environ.get("TARGET_H", "3840"))
+          SCALE = W / 1080.0
+
+          SURAH_NUMBER = int(os.environ.get("SURAH_NUMBER", "0"))
+          BN_NAME = os.environ.get("BANGLA_NAME", "").strip()
+          LOGO_PATH = os.environ.get("LOGO_PATH", "src/logo.jpg").strip()
+          # ARABIC_NAME env kept for future use, intentionally not drawn.
+
+          os.makedirs(OUT, exist_ok=True)
+
+          EN_TO_BN = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
+          def to_bangla_num(s): return str(s).translate(EN_TO_BN)
+
+          def extract_number(s):
+              s = str(s).translate(str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789"))
+              m = re.search(r'\d+', s)
+              return int(m.group()) if m else 0
+
+          def normalize_arabic_display(text):
+              return text.replace('\u0671', '\u0627')
+
+          def get_font(is_ar, px_size):
+              p = FONT_AR if is_ar else FONT_BN
+              try:
+                  return ImageFont.truetype(p, max(1, int(px_size)))
+              except Exception:
+                  return ImageFont.load_default()
+
+          def wrap_text(draw, text, font, max_w):
+              lines, cur = [], ""
+              for w in text.split():
+                  test = f"{cur} {w}".strip()
+                  if draw.textlength(test, font=font) <= max_w:
+                      cur = test
+                  else:
+                      if cur:
+                          lines.append(cur)
+                      cur = w
+              if cur:
+                  lines.append(cur)
+              return lines
+
+          def draw_stroked(draw, xy, text, font, fill, stroke=None):
+              draw.text(xy, text, font=font, fill=fill)
+
+          def draw_centered(draw, cx, y, text, font, fill, stroke=None):
+              w = draw.textlength(text, font=font)
+              draw_stroked(draw, (cx - w / 2, y), text, font, fill, stroke)
+
+          # ---------- style constants (tweak freely) ----------
+          SIDE_MARGIN     = int(50 * SCALE)
+          MAX_TEXT_W      = W - 2 * SIDE_MARGIN
+          # ফেসবুক রিলসের নিচের ইউআই (লাইক, কমেন্ট, ক্যাপশন) যাতে লেখা না ঢাকে, 
+          # সেজন্য নিچ থেকে মার্জিন বাড়িয়ে ১৫ ডিপি (স্কেল অনুযায়ী) ওপরে তোলা হলো:
+          BOTTOM_MARGIN   = int((90 + 15) * SCALE)
+          TOP_LIMIT       = int(H * 0.30)
+          MAX_BLOCK_RATIO = 0.60
+
+          PILL_BG    = (255, 255, 255, 235)
+          PILL_TEXT  = (25, 25, 35, 255)
+          BADGE_BG   = (32, 92, 210, 255)
+          BADGE_TEXT = (255, 255, 255, 255)
+          BAR_BG     = (12, 14, 26, 175)
+          WHITE      = (255, 255, 255, 255)
+          GOLD       = (255, 224, 130, 255)
+
+          BASE_PILL_FONT  = 34
+          BASE_BADGE_FONT = 38
+          BASE_AR_FONT    = 58
+          BASE_LABEL_FONT = 28
+          BASE_BN_FONT    = 40
+          FONT_FLOOR      = 22
+          GAP             = int(26 * SCALE)
+          BAR_PAD_X       = int(34 * SCALE)
+          BAR_PAD_Y       = int(22 * SCALE)
+          BADGE_PAD_X     = int(26 * SCALE)
+          BADGE_GAP       = int(40 * SCALE)
+
+          # লোগো সেটিংস (top-right corner)
+          LOGO_MARGIN = int(50 * SCALE)
+          LOGO_MAX_W  = int(160 * SCALE)
+          # ------------------------------------------------------
+
+          with open(DATA, encoding="utf-8") as f:
+              data = json.load(f)
+
+          data = [it for it in data if extract_number(it.get('sura', '0')) == SURAH_NUMBER]
+          print(f"Found {len(data)} ayahs for surah {SURAH_NUMBER}")
+
+          _dummy = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
+
+          logo_img = None
+          if LOGO_PATH and os.path.exists(LOGO_PATH):
+              try:
+                  _logo = Image.open(LOGO_PATH).convert("RGBA")
+                  ratio = LOGO_MAX_W / _logo.width
+                  new_size = (LOGO_MAX_W, max(1, int(_logo.height * ratio)))
+                  logo_img = _logo.resize(new_size, Image.LANCZOS)
+              except Exception as e:
+                  print(f"Logo load failed: {e}")
+                  logo_img = None
+          else:
+              print(f"Logo not found at {LOGO_PATH}, skipping logo overlay")
+
+          for item in data:
+              sura_int = extract_number(item.get('sura', '0'))
+              ayat_int = extract_number(item.get('verses', '0'))
+              filename = f"{sura_int:03d}{ayat_int:03d}.png"
+              ayat_disp = to_bangla_num(ayat_int)
+
+              draw_badge = ayat_int != 0
+
+              arabic_text = normalize_arabic_display(item.get('names', '').strip())
+              bangla_translation = item.get('name', '').strip()
+              bangla_translation = re.sub(r'\s*\(\s*[0-9০-৯]+\s*\)', '', bangla_translation)
+              bangla_translation = re.sub(r'\s{2,}', ' ', bangla_translation).strip()
+
+              pill_text = f"সূরা {BN_NAME}".strip()
+
+              ar_size, bn_size = BASE_AR_FONT, BASE_BN_FONT
+              label_size = BASE_LABEL_FONT
+              pill_size, badge_size = BASE_PILL_FONT, BASE_BADGE_FONT
+
+              while True:
+                  f_pill  = get_font(False, pill_size * SCALE)
+                  f_badge = get_font(False, badge_size * SCALE)
+                  f_ar    = get_font(True, ar_size * SCALE)
+                  f_label = get_font(False, label_size * SCALE)
+                  f_bn    = get_font(False, bn_size * SCALE)
+
+                  max_pill_w = W * 0.55
+                  while _dummy.textlength(pill_text, font=f_pill) > max_pill_w and pill_size > FONT_FLOOR:
+                      pill_size -= 2
+                      f_pill = get_font(False, pill_size * SCALE)
+
+                  badge_diam = int(f_pill.size * 2.3)
+
+                  ar_lines = wrap_text(_dummy, arabic_text, f_ar, MAX_TEXT_W - 2 * BAR_PAD_X)
+                  bn_lines = wrap_text(_dummy, bangla_translation, f_bn, MAX_TEXT_W - 2 * BAR_PAD_X)
+
+                  badge_row_h = badge_diam + GAP
+                  ar_bar_h    = len(ar_lines) * int(f_ar.size * 1.5) + 2 * BAR_PAD_Y
+                  label_h     = int(f_label.size * 1.4)
+                  bn_bar_h    = label_h + len(bn_lines) * int(f_bn.size * 1.45) + 2 * BAR_PAD_Y
+
+                  total_h = badge_row_h + GAP + ar_bar_h + GAP + bn_bar_h
+
+                  if total_h <= H * MAX_BLOCK_RATIO or (ar_size <= FONT_FLOOR and bn_size <= FONT_FLOOR):
+                      break
+                  ar_size = max(FONT_FLOOR, ar_size - 2)
+                  bn_size = max(FONT_FLOOR, bn_size - 2)
+                  label_size = max(FONT_FLOOR - 4, label_size - 1)
+
+              block_bottom = H - BOTTOM_MARGIN
+              block_top = block_bottom - total_h
+              block_top = max(TOP_LIMIT, block_top)
+
+              bg = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+              draw = ImageDraw.Draw(bg)
+
+              y = block_top
+              cx = W // 2
+
+              pill_w = _dummy.textlength(pill_text, font=f_pill) + 2 * BADGE_PAD_X
+              pill_h = badge_diam
+
+              if draw_badge:
+                  row_total_w = pill_w + BADGE_GAP + badge_diam
+              else:
+                  row_total_w = pill_w
+
+              row_left = cx - row_total_w / 2
+              pill_box = [row_left, y, row_left + pill_w, y + pill_h]
+              draw.rounded_rectangle(pill_box, radius=pill_h // 2, fill=PILL_BG)
+              ptx = row_left + BADGE_PAD_X
+              pty = y + (pill_h - f_pill.size) / 2 - int(6 * SCALE)
+              draw.text((ptx, pty), pill_text, font=f_pill, fill=PILL_TEXT)
+
+              if draw_badge:
+                  circle_cx = row_left + pill_w + BADGE_GAP
+                  circle_box = [circle_cx, y, circle_cx + badge_diam, y + badge_diam]
+                  draw.ellipse(circle_box, fill=BADGE_BG)
+                  draw_centered(draw, circle_cx + badge_diam / 2,
+                                y + (badge_diam - f_badge.size) / 2 - int(4 * SCALE),
+                                ayat_disp, f_badge, BADGE_TEXT)
+
+              y += badge_row_h + GAP
+
+              bar_box = [SIDE_MARGIN, y, W - SIDE_MARGIN, y + ar_bar_h]
+              draw.rounded_rectangle(bar_box, radius=int(18 * SCALE), fill=BAR_BG)
+              ty = y + BAR_PAD_Y
+              for line in ar_lines:
+                  draw_centered(draw, cx, ty, line, f_ar, WHITE)
+                  ty += int(f_ar.size * 1.5)
+
+              y += ar_bar_h + GAP
+
+              bar_box2 = [SIDE_MARGIN, y, W - SIDE_MARGIN, y + bn_bar_h]
+              draw.rounded_rectangle(bar_box2, radius=int(18 * SCALE), fill=BAR_BG)
+              ty = y + BAR_PAD_Y
+              draw_centered(draw, cx, ty, "কানযুল ঈমান থেকে অনুবাদ:", f_label, GOLD)
+              ty += label_h
+              for line in bn_lines:
+                  draw_centered(draw, cx, ty, line, f_bn, WHITE)
+                  ty += int(f_bn.size * 1.45)
+
+              if logo_img is not None:
+                  lx = W - LOGO_MARGIN - logo_img.width
+                  ly = LOGO_MARGIN
+                  bg.alpha_composite(logo_img, (lx, ly))
+
+              bg.save(os.path.join(OUT, filename))
+              print(f"Done {filename} | AR font {ar_size} BN font {bn_size} | badge={draw_badge}")
+          PY
+
+      # ---------------------------------------------------------
+      # ধাপ ১.৫: এই সূরার আয়াতগুলোর অডিও এনহ্যান্স করা হচ্ছে -
+      # ---------------------------------------------------------
+      - name: Enhance & denoise ayah audio
+        env:
+          AUDIO_DIR: ${{ inputs.audio_folder }}
+          SURAH: ${{ inputs.surah_number }}
+        run: |
+          set -e
+          ENHANCED_DIR="enhanced_audio"
+          mkdir -p "$ENHANCED_DIR"
+
+          for overlay_file in $(ls overlays/${SURAH}*.png 2>/dev/null | sort -V); do
+            [ -e "$overlay_file" ] || continue
+            base=$(basename "$overlay_file" .png)
+            src="$AUDIO_DIR/$base.mp3"
+
+            if [ ! -f "$src" ]; then
+              echo "Audio missing: $src - enhance step skip kora hocche"
+              continue
+            fi
+
+            echo "Enhancing $base.mp3 (noise reduction + loudness normalize)..."
+            if ! ffmpeg -y -hide_banner -loglevel error \
+              -i "$src" \
+              -af "afftdn=nf=-25,highpass=f=80,lowpass=f=8000,loudnorm=I=-16:TP=-1.5:LRA=11" \
+              -c:a libmp3lame -b:a 192k \
+              "$ENHANCED_DIR/$base.mp3"; then
+              echo "Enhance failed for $base.mp3 - original file পরের ধাপে fallback হিসেবে ব্যবহৃত হবে"
+            fi
+          done
+
+          echo "Enhanced audio files:"
+          ls -lh "$ENHANCED_DIR" 2>/dev/null || echo "(kono file enhance hoyni)"
+
+      # ---------------------------------------------------------
+      # ধাপ ২: প্রতিটা background ভিডিও আলাদাভাবে normalize করা
+      # ---------------------------------------------------------
+      - name: Normalize & merge background video(s)
+        env:
+          TARGET_W: ${{ inputs.target_width }}
+          TARGET_H: ${{ inputs.target_height }}
+        run: |
+          mkdir -p normalized
+          > normalize_concat_list.txt
+
+          i=0
+          while IFS= read -r BG_VIDEO; do
+            i=$((i+1))
+            BG_W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$BG_VIDEO")
+            BG_H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$BG_VIDEO")
+            echo "[$i] $BG_VIDEO -> Original: ${BG_W}x${BG_H} | Target: ${TARGET_W}x${TARGET_H}"
+
+            OUT="normalized/part_${i}.mp4"
+            ffmpeg -y -hide_banner -loglevel error \
+              -i "$BG_VIDEO" \
+              -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase,crop=${TARGET_W}:${TARGET_H},setsar=1,fps=30" \
+              -c:v libx264 -preset medium -crf 16 -pix_fmt yuv420p \
+              -an \
+              "$OUT"
+
+            echo "file '$(realpath "$OUT")'" >> normalize_concat_list.txt
+          done < bg_list.txt
+
+          echo "Merging $i background video(s) into one..."
+          ffmpeg -y -hide_banner -loglevel error \
+            -f concat -safe 0 -i normalize_concat_list.txt \
+            -c copy \
+            normalized/background_normalized.mp4
+
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 normalized/background_normalized.mp4
+
+      # ---------------------------------------------------------
+      # ধাপ ২.৫: normalize/merge করা background video থেকে seamless ping-pong লুপ
+      # ---------------------------------------------------------
+      - name: Create seamless ping-pong (forward+reverse) background
+        run: |
+          set -e
+          echo "Background video reverse kore ping-pong loop banano hocche..."
+
+          ffmpeg -y -hide_banner -loglevel error \
+            -i normalized/background_normalized.mp4 \
+            -vf "reverse" -an \
+            -c:v libx264 -preset medium -crf 16 -pix_fmt yuv420p \
+            normalized/background_reversed.mp4
+
+          echo "file '$(realpath normalized/background_normalized.mp4)'" > pingpong_concat_list.txt
+          echo "file '$(realpath normalized/background_reversed.mp4)'" >> pingpong_concat_list.txt
+
+          ffmpeg -y -hide_banner -loglevel error \
+            -f concat -safe 0 -i pingpong_concat_list.txt \
+            -c copy \
+            normalized/background_pingpong.mp4
+
+          rm -f normalized/background_reversed.mp4 pingpong_concat_list.txt
+
+          echo "Ping-pong background toiri holo, duration:"
+          ffprobe -v error -show_entries format=duration -of csv=p=0 normalized/background_pingpong.mp4
+
+      # ---------------------------------------------------------
+      # ধাপ ৩: প্রতিটা আয়াতের ক্লিপ বানানো (background + overlay + audio)
+      # ---------------------------------------------------------
+      - name: Build per-ayah clips and merge
+        env:
+          AUDIO_DIR: ${{ inputs.audio_folder }}
+          SURAH: ${{ inputs.surah_number }}
+        run: |
+          set -e
+          TEMP_VIDEO_DIR="temp_${SURAH}_videos"
+          FINAL_DIR="rizwanSurahVideo"
+          PINGPONG="normalized/background_pingpong.mp4"
+          BG_FULL="normalized/background_full.mp4"
+          ENHANCED_AUDIO_DIR="enhanced_audio"
+
+          mkdir -p "$TEMP_VIDEO_DIR" "$FINAL_DIR"
+
+          resolve_audio_file() {
+            local base="$1"
+            if [ -f "$ENHANCED_AUDIO_DIR/$base.mp3" ]; then
+              echo "$ENHANCED_AUDIO_DIR/$base.mp3"
+            else
+              echo "$AUDIO_DIR/$base.mp3"
+            fi
+          }
+
+          TOTAL_DURATION=0
+          for overlay_file in $(ls overlays/${SURAH}*.png 2>/dev/null | sort -V); do
+            [ -e "$overlay_file" ] || continue
+            base=$(basename "$overlay_file" .png)
+            audio_file=$(resolve_audio_file "$base")
+            [ -f "$audio_file" ] || continue
+            DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$audio_file")
+            TOTAL_DURATION=$(echo "$TOTAL_DURATION + $DUR" | bc)
+          done
+
+          if [ -z "$TOTAL_DURATION" ] || [ "$(echo "$TOTAL_DURATION <= 0" | bc)" -eq 1 ]; then
+            echo "Kono audio duration paoa jayni Surah $SURAH er jonno"
+            exit 1
+          fi
+          echo "Total surah audio duration: ${TOTAL_DURATION}s"
+
+          CYCLE_DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$PINGPONG")
+          LOOP_COUNT=$(awk -v t="$TOTAL_DURATION" -v c="$CYCLE_DURATION" 'BEGIN{n=t/c; if (n<1) n=1; printf "%d", n+3}')
+          echo "Ping-pong cycle duration: ${CYCLE_DURATION}s | Loop count: $LOOP_COUNT"
+
+          ffmpeg -y -hide_banner -loglevel error \
+            -stream_loop "$LOOP_COUNT" -i "$PINGPONG" \
+            -t "$TOTAL_DURATION" \
+            -c:v libx264 -preset medium -crf 16 -pix_fmt yuv420p \
+            -an \
+            "$BG_FULL"
+
+          echo "Full continuous ping-pong background toiri holo:"
+          ffprobe -v error -show_entries format=duration -of csv=p=0 "$BG_FULL"
+
+          OFFSET=0
+
+          for overlay_file in $(ls overlays/${SURAH}*.png 2>/dev/null | sort -V); do
+            [ -e "$overlay_file" ] || continue
+            base=$(basename "$overlay_file" .png)
+            audio_file=$(resolve_audio_file "$base")
+
+            if [ ! -f "$audio_file" ]; then
+              echo "Audio missing: $audio_file - Skipping"
+              continue
+            fi
+
+            DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$audio_file")
+            echo "Processing $base | background offset: ${OFFSET}s | audio duration: ${DURATION}s"
+
+            ffmpeg -y -hide_banner -loglevel error \
+              -ss "$OFFSET" -i "$BG_FULL" \
+              -loop 1 -i "$overlay_file" \
+              -i "$audio_file" \
+              -filter_complex "[0:v][1:v]overlay=0:0:shortest=1[outv]" \
+              -map "[outv]" -map 2:a \
+              -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p \
+              -c:a aac -b:a 192k \
+              -shortest \
+              "$TEMP_VIDEO_DIR/$base.mp4"
+
+            OFFSET=$(echo "$OFFSET + $DURATION" | bc)
+          done
+
+          if ! ls "$TEMP_VIDEO_DIR"/${SURAH}*.mp4 1> /dev/null 2>&1; then
+            echo "Kono clip toiri hoyni Surah $SURAH er jonno"
+            exit 1
+          fi
+
+          ls -1 "$TEMP_VIDEO_DIR"/${SURAH}*.mp4 | sort -V | while read f; do
+            echo "file '$(realpath "$f")'"
+          done > concat_list.txt
+
+          ffmpeg -y -hide_banner -loglevel error \
+            -f concat -safe 0 -i concat_list.txt \
+            -c copy \
+            "$FINAL_DIR/${SURAH}_4K.mp4"
+
+          ls -lh "$FINAL_DIR"/
+          rm -rf "$TEMP_VIDEO_DIR" concat_list.txt
+
+      # ---------------------------------------------------------
+      # ধাপ ৪: master (4K) ভিডিও থেকেই Full HD ও HD ভার্সন বানানো
+      # ---------------------------------------------------------
+      - name: Create Full HD & HD versions from the 4K master
+        env:
+          SURAH: ${{ inputs.surah_number }}
+        run: |
+          set -e
+          FINAL_DIR="rizwanSurahVideo"
+          MASTER="$FINAL_DIR/${SURAH}_4K.mp4"
+
+          echo "Creating Full HD (1080x1920) version..."
+          ffmpeg -y -hide_banner -loglevel error \
+            -i "$MASTER" \
+            -vf "scale=1080:1920:flags=lanczos,setsar=1" \
+            -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p \
+            -c:a copy \
+            "$FINAL_DIR/${SURAH}_FullHD.mp4"
+
+          echo "Creating HD (720x1280) version..."
+          ffmpeg -y -hide_banner -loglevel error \
+            -i "$MASTER" \
+            -vf "scale=720:1280:flags=lanczos,setsar=1" \
+            -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p \
+            -c:a copy \
+            "$FINAL_DIR/${SURAH}_HD.mp4"
+
+          rm -rf normalized
+          ls -lh "$FINAL_DIR"/
+
+      - name: Upload Final Videos (workflow artifact - temporary)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Surah-${{ inputs.surah_number }}-Portrait-Video-AllResolutions
+          path: |
+            rizwanSurahVideo/${{ inputs.surah_number }}_4K.mp4
+            rizwanSurahVideo/${{ inputs.surah_number }}_FullHD.mp4
+            rizwanSurahVideo/${{ inputs.surah_number }}_HD.mp4
+          if-no-files-found: error
+
+      # ---------------------------------------------------------
+      # ধাপ ৫: GitHub Release-এ পাবলিশ করা
+      # ---------------------------------------------------------
+      - name: Publish Surah Video (4K + Full HD + HD) as GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: surah-${{ inputs.surah_number }}
+          name: "সূরা ${{ inputs.bangla_name }} (নং ${{ inputs.surah_number }}) - Portrait Video"
+          body: |
+            🎬 সূরা ${{ inputs.bangla_name }} (সূরা নং ${{ inputs.surah_number }}) এর পোর্ট্রেট (৯:১৬) ভিডিও - তিনটা রেজোলিউশনে:
+            - 4K: ${{ inputs.target_width }}x${{ inputs.target_height }}
+            - Full HD: 1080x1920
+            - HD: 720x1280
+          files: |
+            rizwanSurahVideo/${{ inputs.surah_number }}_4K.mp4
+            rizwanSurahVideo/${{ inputs.surah_number }}_FullHD.mp4
+            rizwanSurahVideo/${{ inputs.surah_number }}_HD.mp4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit overlays to repo
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f overlays/
+          git commit -m "Surah ${{ inputs.surah_number }}: portrait overlays generated (video published via Release)" || echo "No changes"
+          git push || echo "Push failed"
